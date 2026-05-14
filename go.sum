@@ -1,3 +1,5 @@
+github.com/PS-safe/ratelimit v0.0.0-20260513101740-816754d3fa5a h1:lo3D3KY6u342WOBTpz0Fdmlzht6f3dThSSyt5jp49jw=
+github.com/PS-safe/ratelimit v0.0.0-20260513101740-816754d3fa5a/go.mod h1:T7s/bvXAXwnY5swf3mamAvTIZmegBhd+eTCH1+vWyQ0=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=

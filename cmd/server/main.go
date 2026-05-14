@@ -29,9 +29,19 @@ import (
 	"github.com/PS-safe/auth/postgres"
 	"github.com/PS-safe/auth/rbac"
 	"github.com/PS-safe/auth/session"
+	rl "github.com/PS-safe/ratelimit"
+	rlmem "github.com/PS-safe/ratelimit/memory"
+	rlmw "github.com/PS-safe/ratelimit/middleware"
 )
 
-const sessionTTL = 7 * 24 * time.Hour
+const (
+	sessionTTL = 7 * 24 * time.Hour
+
+	// Credential endpoints (/signup, /login) share one per-IP limiter so an
+	// attacker can't get double the budget by alternating between them.
+	credentialRateLimit  = 5
+	credentialRateWindow = time.Minute
+)
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -46,10 +56,17 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	credLimiter, err := rlmem.New(rl.Config{Limit: credentialRateLimit, Window: credentialRateWindow})
+	if err != nil {
+		logger.Error("rate limiter", "err", err)
+		os.Exit(1)
+	}
+	rateLimit := rlmw.Middleware(credLimiter)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
-	mux.HandleFunc("POST /signup", signupHandler(store, logger))
-	mux.HandleFunc("POST /login", loginHandler(store, logger))
+	mux.Handle("POST /signup", rateLimit(signupHandler(store, logger)))
+	mux.Handle("POST /login", rateLimit(loginHandler(store, logger)))
 	mux.HandleFunc("POST /logout", logoutHandler(store))
 
 	auth := middleware.RequireSession(store)

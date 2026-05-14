@@ -50,6 +50,7 @@ mux.Handle("GET /admin", middleware.RequireSession(store)(
 - **Generic 401s.** `/login` returns the same error for "no such user" vs "wrong password" to avoid enumeration.
 - **RBAC built in.** Static role-permission map; tiny, obvious, and easy to extend when needed.
 - **Cookies are `HttpOnly`, `Secure`, `SameSite=Lax`** by default in `cmd/server`.
+- **Credential endpoints are rate-limited.** `/signup` and `/login` share one per-IP sliding-window limiter (5/min) via [`github.com/PS-safe/ratelimit`](https://github.com/PS-safe/ratelimit) — basic defense against credential stuffing and signup abuse.
 
 ## Status
 
@@ -98,7 +99,6 @@ go run ./cmd/server
 - [ ] Refresh tokens (long-lived opaque) on top of short-lived access tokens
 - [ ] Email verification on signup
 - [ ] Password reset flow (one-time tokens, expiry, single-use)
-- [ ] Rate limiting on `/login` / `/signup` (drop-in via `github.com/PS-safe/ratelimit/middleware`)
 - [ ] OAuth providers (Google, GitHub) behind a uniform interface
 - [ ] WebAuthn / passkeys
 - [ ] testcontainers-go integration tests against real Postgres
