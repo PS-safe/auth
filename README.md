@@ -117,7 +117,7 @@ go test ./...
 go run ./cmd/server
 ```
 
-## Roadmap
+## Future work
 
 - [ ] Refresh tokens (long-lived opaque) on top of short-lived access tokens
 - [ ] OAuth providers (Google, GitHub) behind a uniform interface
