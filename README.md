@@ -52,6 +52,8 @@ mux.Handle("GET /admin", middleware.RequireSession(store)(
 - **Cookies are `HttpOnly`, `Secure`, `SameSite=Lax`** by default in `cmd/server`.
 - **Credential endpoints are rate-limited.** `/signup` and `/login` share one per-IP sliding-window limiter (5/min) via [`github.com/PS-safe/ratelimit`](https://github.com/PS-safe/ratelimit) — basic defense against credential stuffing and signup abuse.
 - **Email verification, atomically.** Signup issues an opaque verification token (sha256 in the DB, raw in the email) via [`github.com/PS-safe/mailer`](https://github.com/PS-safe/mailer). `ConsumeEmailVerification` validates + marks consumed + sets `users.verified_at` in one transaction — two clicks on the same link can't both succeed.
+- **Password reset that revokes existing sessions.** `ConsumePasswordReset` validates the token, sets the new password hash, and `DELETE`s every session for that user — all in one transaction. If the old password was compromised, no attacker session survives the reset.
+- **Anti-enumeration on `/reset/request`.** Always returns 204, whether the email is registered or not, so the endpoint can't be used to probe which addresses have accounts.
 
 ## Status
 
@@ -72,6 +74,9 @@ type Store interface {
 
     CreateEmailVerification(ctx, EmailVerification) error
     ConsumeEmailVerification(ctx, tokenHash) (*EmailVerification, error)
+
+    CreatePasswordReset(ctx, PasswordReset) error
+    ConsumePasswordReset(ctx, tokenHash, newPasswordHash) (*PasswordReset, error)
 }
 ```
 
@@ -85,6 +90,8 @@ type Store interface {
 | `GET`  | `/me`     | current user (requires session) |
 | `GET`  | `/verify?token=...` | consume verification link from email |
 | `POST` | `/verify/resend`    | re-send verification email (requires session) |
+| `POST` | `/reset/request`    | `{email}` → 204 always (anti-enumeration); emails a reset link if email is registered |
+| `POST` | `/reset/confirm`    | `{token, new_password}` → 200 user, all prior sessions revoked |
 | `GET`  | `/admin/users` | admin-only (requires `users:read`) |
 
 The `cmd/server` demo lets users log in without verifying — `User.VerifiedAt`
@@ -113,7 +120,6 @@ go run ./cmd/server
 ## Roadmap
 
 - [ ] Refresh tokens (long-lived opaque) on top of short-lived access tokens
-- [ ] Password reset flow (one-time tokens, expiry, single-use)
 - [ ] OAuth providers (Google, GitHub) behind a uniform interface
 - [ ] WebAuthn / passkeys
 - [ ] testcontainers-go integration tests against real Postgres

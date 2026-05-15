@@ -1,12 +1,14 @@
 // Command server is the demo HTTP API for the auth library.
 //
-//	POST /signup           {email, password}        -> 201 + Set-Cookie + verification email
-//	POST /login            {email, password}        -> 200 + Set-Cookie
-//	POST /logout                                    -> 204
-//	GET  /me                                        -> 200 (requires session)
-//	GET  /verify?token=... (link clicked from email)-> 200 plain text
-//	POST /verify/resend                             -> 204 (requires session)
-//	GET  /admin/users                               -> 200 (requires admin)
+//	POST /signup           {email, password}            -> 201 + Set-Cookie + verification email
+//	POST /login            {email, password}            -> 200 + Set-Cookie
+//	POST /logout                                        -> 204
+//	GET  /me                                            -> 200 (requires session)
+//	GET  /verify?token=... (link clicked from email)    -> 200 plain text
+//	POST /verify/resend                                 -> 204 (requires session)
+//	POST /reset/request    {email}                      -> 204 always (anti-enumeration)
+//	POST /reset/confirm    {token, new_password}        -> 200 user (sessions revoked)
+//	GET  /admin/users                                   -> 200 (requires admin)
 //	GET  /healthz
 //
 // Compose example: this server wires github.com/PS-safe/auth together with
@@ -38,6 +40,7 @@ import (
 	"github.com/PS-safe/auth/postgres"
 	"github.com/PS-safe/auth/rbac"
 	"github.com/PS-safe/auth/session"
+	"github.com/PS-safe/auth/reset"
 	"github.com/PS-safe/auth/verify"
 	"github.com/PS-safe/mailer"
 	mbrevo "github.com/PS-safe/mailer/brevo"
@@ -51,9 +54,14 @@ import (
 const (
 	sessionTTL = 7 * 24 * time.Hour
 	verifyTTL  = 24 * time.Hour
+	resetTTL   = 1 * time.Hour
 
-	// Credential endpoints (/signup, /login) share one per-IP limiter so an
-	// attacker can't get double the budget by alternating between them.
+	// Credential-adjacent endpoints (/signup, /login, /reset/request) share
+	// one per-IP limiter so an attacker can't get extra budget by switching
+	// between them. /reset/confirm is intentionally NOT in this bucket — a
+	// shared bucket would let token brute-forcing self-DoS legitimate
+	// logins, and brute-forcing a 256-bit token is computationally
+	// infeasible anyway.
 	credentialRateLimit  = 5
 	credentialRateWindow = time.Minute
 )
@@ -94,6 +102,8 @@ func main() {
 	mux.Handle("POST /login", rateLimit(loginHandler(store, logger)))
 	mux.HandleFunc("POST /logout", logoutHandler(store))
 	mux.HandleFunc("GET /verify", verifyHandler(store, logger))
+	mux.Handle("POST /reset/request", rateLimit(resetRequestHandler(store, sender, baseURL, logger)))
+	mux.HandleFunc("POST /reset/confirm", resetConfirmHandler(store, logger))
 
 	auth := middleware.RequireSession(store)
 	mux.Handle("GET /me", auth(http.HandlerFunc(meHandler)))
@@ -312,6 +322,127 @@ func verifyResendHandler(store a.Store, sender mailer.Sender, baseURL string, lo
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
+}
+
+type emailRequest struct {
+	Email string `json:"email"`
+}
+
+type resetConfirmRequest struct {
+	Token       string `json:"token"`
+	NewPassword string `json:"new_password"`
+}
+
+// resetRequestHandler issues a password-reset token and emails it. It ALWAYS
+// returns 204 — replying differently for "email registered" vs "email
+// unknown" would leak which addresses have accounts. The work below the
+// user-not-found branch is intentionally skipped; production code that
+// cares about timing-based enumeration would add a constant-time fallback.
+func resetRequestHandler(store a.Store, sender mailer.Sender, baseURL string, logger *slog.Logger) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req emailRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			// Still return 204 — no need to leak that the request body was
+			// even readable.
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		email := strings.TrimSpace(strings.ToLower(req.Email))
+		if email == "" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		user, err := store.UserByEmail(r.Context(), email)
+		if err != nil {
+			// Unknown email — don't tell the client.
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if err := issueReset(r.Context(), store, sender, baseURL, user); err != nil {
+			logger.Error("issue password reset", "user_id", user.ID, "err", err)
+			// Still 204 — failure leaks no more than "email exists" would.
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+}
+
+func resetConfirmHandler(store a.Store, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req resetConfirmRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		if req.Token == "" || len(req.NewPassword) < 8 {
+			http.Error(w, "token or new_password invalid", http.StatusBadRequest)
+			return
+		}
+		newHash, err := password.Hash(req.NewPassword)
+		if err != nil {
+			logger.Error("hash new password", "err", err)
+			http.Error(w, "internal", http.StatusInternalServerError)
+			return
+		}
+		rec, err := store.ConsumePasswordReset(r.Context(), reset.Hash(req.Token), newHash)
+		switch {
+		case errors.Is(err, a.ErrNotFound):
+			http.Error(w, "reset link not found", http.StatusNotFound)
+			return
+		case errors.Is(err, a.ErrExpired):
+			http.Error(w, "reset link expired — request a new one", http.StatusGone)
+			return
+		case errors.Is(err, a.ErrAlreadyConsumed):
+			http.Error(w, "this link has already been used", http.StatusGone)
+			return
+		case err != nil:
+			logger.Error("consume password reset", "err", err)
+			http.Error(w, "internal", http.StatusInternalServerError)
+			return
+		}
+		user, err := store.UserByID(r.Context(), rec.UserID)
+		if err != nil {
+			logger.Error("lookup user after reset", "user_id", rec.UserID, "err", err)
+			http.Error(w, "internal", http.StatusInternalServerError)
+			return
+		}
+		writeUser(w, http.StatusOK, user)
+	}
+}
+
+func issueReset(ctx context.Context, store a.Store, sender mailer.Sender, baseURL string, user *a.User) error {
+	tok, err := reset.Generate()
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	err = store.CreatePasswordReset(ctx, a.PasswordReset{
+		TokenHash: reset.Hash(tok),
+		UserID:    user.ID,
+		ExpiresAt: now.Add(resetTTL),
+		CreatedAt: now,
+	})
+	if err != nil {
+		return err
+	}
+	// The link points at where the user's frontend hosts the reset form. The
+	// API endpoint itself is POST /reset/confirm; this URL is what goes in
+	// the email body, not necessarily a URL this server serves.
+	link := baseURL + "/reset?token=" + url.QueryEscape(tok)
+	from := mailer.Address{Name: os.Getenv("MAIL_FROM_NAME"), Email: os.Getenv("MAIL_FROM")}
+	if from.Email == "" {
+		from.Email = "no-reply@auth.local"
+	}
+	msg := mailer.Message{
+		From:    from,
+		To:      []mailer.Address{{Email: user.Email}},
+		Subject: "Reset your password",
+		Text: "Use the link below to choose a new password. It expires in 1 hour. " +
+			"If you didn't ask for this, you can ignore this email.\n\n" + link + "\n",
+		HTML: `<p>Use the link below to choose a new password. It expires in 1 hour.</p>` +
+			`<p>If you didn't ask for this, you can ignore this email.</p>` +
+			`<p><a href="` + link + `">` + link + `</a></p>`,
+	}
+	return sender.Send(ctx, msg)
 }
 
 // issueVerification persists a fresh verification token for user and emails

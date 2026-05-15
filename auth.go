@@ -7,6 +7,7 @@
 //	password  — argon2id hashing
 //	session   — opaque session-token generation + hashing
 //	verify    — opaque email-verification-token generation + hashing
+//	reset     — opaque password-reset-token generation + hashing
 //	rbac      — roles and permissions
 //	memory    — in-process Store (tests, dev)
 //	postgres  — durable Store (production)
@@ -59,6 +60,17 @@ type EmailVerification struct {
 	CreatedAt  time.Time
 }
 
+// PasswordReset is a one-shot, single-use token issued when a user requests
+// a password reset and consumed when they pick a new password. Like other
+// tokens in this package, only sha256(token) is persisted.
+type PasswordReset struct {
+	TokenHash  string
+	UserID     string
+	ExpiresAt  time.Time
+	ConsumedAt *time.Time
+	CreatedAt  time.Time
+}
+
 // Store is the contract every backend must satisfy.
 type Store interface {
 	// CreateUser persists a new user. Email must be unique.
@@ -92,6 +104,16 @@ type Store interface {
 	// ErrNotFound, ErrExpired, or ErrAlreadyConsumed on the respective
 	// failure modes — never leaves the DB in a partial state.
 	ConsumeEmailVerification(ctx context.Context, tokenHash string) (*EmailVerification, error)
+
+	// CreatePasswordReset persists a new reset record. TokenHash should be
+	// sha256 of the raw token — the raw token is never stored.
+	CreatePasswordReset(ctx context.Context, r PasswordReset) error
+
+	// ConsumePasswordReset atomically validates the token, marks it
+	// consumed, sets the user's password hash to newPasswordHash, and
+	// revokes ALL of the user's sessions (if a reset is being run, every
+	// existing session is suspect). Returns the reset record.
+	ConsumePasswordReset(ctx context.Context, tokenHash, newPasswordHash string) (*PasswordReset, error)
 }
 
 var (

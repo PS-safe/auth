@@ -16,6 +16,7 @@ type Store struct {
 	usersByEmail  map[string]string               // email (lowercase) -> id
 	sessions      map[string]*a.Session           // tokenHash -> session
 	verifications map[string]*a.EmailVerification // tokenHash -> verification
+	resets        map[string]*a.PasswordReset     // tokenHash -> reset
 }
 
 func New() *Store {
@@ -24,6 +25,7 @@ func New() *Store {
 		usersByEmail:  make(map[string]string),
 		sessions:      make(map[string]*a.Session),
 		verifications: make(map[string]*a.EmailVerification),
+		resets:        make(map[string]*a.PasswordReset),
 	}
 }
 
@@ -167,5 +169,56 @@ func (s *Store) ConsumeEmailVerification(_ context.Context, tokenHash string) (*
 	v.ConsumedAt = &now
 	user.VerifiedAt = &now
 	cp := *v
+	return &cp, nil
+}
+
+func (s *Store) CreatePasswordReset(_ context.Context, r a.PasswordReset) error {
+	if r.TokenHash == "" || r.UserID == "" {
+		return a.ErrInvalidInput
+	}
+	if r.CreatedAt.IsZero() {
+		r.CreatedAt = time.Now().UTC()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.users[r.UserID]; !ok {
+		return a.ErrNotFound
+	}
+	cp := r
+	s.resets[r.TokenHash] = &cp
+	return nil
+}
+
+func (s *Store) ConsumePasswordReset(_ context.Context, tokenHash, newPasswordHash string) (*a.PasswordReset, error) {
+	if newPasswordHash == "" {
+		return nil, a.ErrInvalidInput
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.resets[tokenHash]
+	if !ok {
+		return nil, a.ErrNotFound
+	}
+	if r.ConsumedAt != nil {
+		return nil, a.ErrAlreadyConsumed
+	}
+	if time.Now().UTC().After(r.ExpiresAt) {
+		return nil, a.ErrExpired
+	}
+	user, ok := s.users[r.UserID]
+	if !ok {
+		return nil, a.ErrNotFound
+	}
+	now := time.Now().UTC()
+	r.ConsumedAt = &now
+	user.PasswordHash = newPasswordHash
+	// Reset implies the previous password may be compromised — kill every
+	// existing session so the attacker can't ride one in.
+	for h, sess := range s.sessions {
+		if sess.UserID == user.ID {
+			delete(s.sessions, h)
+		}
+	}
+	cp := *r
 	return &cp, nil
 }

@@ -186,6 +186,67 @@ func (s *Store) ConsumeEmailVerification(ctx context.Context, tokenHash string) 
 	return &v, nil
 }
 
+func (s *Store) CreatePasswordReset(ctx context.Context, r a.PasswordReset) error {
+	if r.TokenHash == "" || r.UserID == "" {
+		return a.ErrInvalidInput
+	}
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO password_resets (token_hash, user_id, expires_at)
+		VALUES ($1, $2, $3)
+	`, r.TokenHash, r.UserID, r.ExpiresAt)
+	return err
+}
+
+// ConsumePasswordReset validates the token, sets the new password hash, and
+// revokes every existing session for the user — all in one transaction.
+// SELECT FOR UPDATE serializes concurrent clicks on the same reset link.
+func (s *Store) ConsumePasswordReset(ctx context.Context, tokenHash, newPasswordHash string) (*a.PasswordReset, error) {
+	if newPasswordHash == "" {
+		return nil, a.ErrInvalidInput
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var r a.PasswordReset
+	err = tx.QueryRow(ctx, `
+		SELECT token_hash, user_id, expires_at, consumed_at, created_at
+		  FROM password_resets
+		 WHERE token_hash = $1
+		 FOR UPDATE
+	`, tokenHash).Scan(&r.TokenHash, &r.UserID, &r.ExpiresAt, &r.ConsumedAt, &r.CreatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, a.ErrNotFound
+		}
+		return nil, err
+	}
+	if r.ConsumedAt != nil {
+		return nil, a.ErrAlreadyConsumed
+	}
+	now := time.Now().UTC()
+	if now.After(r.ExpiresAt) {
+		return nil, a.ErrExpired
+	}
+
+	if _, err := tx.Exec(ctx, `UPDATE password_resets SET consumed_at = $1 WHERE token_hash = $2`, now, tokenHash); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE users SET password_hash = $1 WHERE id = $2`, newPasswordHash, r.UserID); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM sessions WHERE user_id = $1`, r.UserID); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	r.ConsumedAt = &now
+	return &r, nil
+}
+
 // userColumns lists user fields in the order scanUser expects. Centralized so
 // every SELECT/RETURNING that hydrates a User stays in sync with the scan.
 const userColumns = `id, email, password_hash, role, verified_at, created_at`
