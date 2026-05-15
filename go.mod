@@ -3,6 +3,7 @@ module github.com/PS-safe/auth
 go 1.25.1
 
 require (
+	github.com/PS-safe/mailer v0.0.0-20260514130805-448f85486368
 	github.com/PS-safe/ratelimit v0.0.0-20260513101740-816754d3fa5a
 	github.com/jackc/pgx/v5 v5.9.2
 	golang.org/x/crypto v0.51.0

@@ -10,6 +10,7 @@ import (
 	"github.com/PS-safe/auth/memory"
 	"github.com/PS-safe/auth/password"
 	"github.com/PS-safe/auth/session"
+	"github.com/PS-safe/auth/verify"
 )
 
 func RunContract(t *testing.T, newStore func() a.Store) {
@@ -107,6 +108,71 @@ func RunContract(t *testing.T, newStore func() a.Store) {
 		}
 		if err := s.DeleteUserSessions(ctx, u.ID); err != nil {
 			t.Fatal(err)
+		}
+	})
+
+	newUserAndToken := func(s a.Store, ttl time.Duration) (*a.User, string) {
+		t.Helper()
+		hash, _ := password.Hash("x")
+		u, err := s.CreateUser(ctx, a.User{ID: "u1", Email: "a@b.com", PasswordHash: hash, Role: "user"})
+		if err != nil {
+			t.Fatalf("CreateUser: %v", err)
+		}
+		tok, _ := verify.Generate()
+		err = s.CreateEmailVerification(ctx, a.EmailVerification{
+			TokenHash: verify.Hash(tok),
+			UserID:    u.ID,
+			Email:     u.Email,
+			ExpiresAt: time.Now().Add(ttl),
+		})
+		if err != nil {
+			t.Fatalf("CreateEmailVerification: %v", err)
+		}
+		return u, tok
+	}
+
+	t.Run("verify_consume_marks_user_verified", func(t *testing.T) {
+		s := newStore()
+		u, tok := newUserAndToken(s, time.Hour)
+		v, err := s.ConsumeEmailVerification(ctx, verify.Hash(tok))
+		if err != nil {
+			t.Fatalf("Consume: %v", err)
+		}
+		if v.ConsumedAt == nil {
+			t.Error("returned verification has nil ConsumedAt")
+		}
+		got, _ := s.UserByID(ctx, u.ID)
+		if got.VerifiedAt == nil {
+			t.Error("user.VerifiedAt is still nil after Consume")
+		}
+	})
+
+	t.Run("verify_expired_token_rejected", func(t *testing.T) {
+		s := newStore()
+		_, tok := newUserAndToken(s, -time.Second)
+		_, err := s.ConsumeEmailVerification(ctx, verify.Hash(tok))
+		if !errors.Is(err, a.ErrExpired) {
+			t.Errorf("err = %v, want ErrExpired", err)
+		}
+	})
+
+	t.Run("verify_already_consumed_rejected", func(t *testing.T) {
+		s := newStore()
+		_, tok := newUserAndToken(s, time.Hour)
+		if _, err := s.ConsumeEmailVerification(ctx, verify.Hash(tok)); err != nil {
+			t.Fatalf("first Consume: %v", err)
+		}
+		_, err := s.ConsumeEmailVerification(ctx, verify.Hash(tok))
+		if !errors.Is(err, a.ErrAlreadyConsumed) {
+			t.Errorf("err = %v, want ErrAlreadyConsumed", err)
+		}
+	})
+
+	t.Run("verify_unknown_token_not_found", func(t *testing.T) {
+		s := newStore()
+		_, err := s.ConsumeEmailVerification(ctx, verify.Hash("never-issued"))
+		if !errors.Is(err, a.ErrNotFound) {
+			t.Errorf("err = %v, want ErrNotFound", err)
 		}
 	})
 }

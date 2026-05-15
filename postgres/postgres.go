@@ -35,8 +35,7 @@ func (s *Store) CreateUser(ctx context.Context, u a.User) (*a.User, error) {
 	row := s.pool.QueryRow(ctx, `
 		INSERT INTO users (id, email, password_hash, role)
 		VALUES ($1, $2, $3, COALESCE(NULLIF($4, ''), 'user'))
-		RETURNING id, email, password_hash, role, created_at
-	`, u.ID, email, u.PasswordHash, u.Role)
+		RETURNING `+userColumns, u.ID, email, u.PasswordHash, u.Role)
 	out, err := scanUser(row)
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -49,7 +48,7 @@ func (s *Store) CreateUser(ctx context.Context, u a.User) (*a.User, error) {
 
 func (s *Store) UserByEmail(ctx context.Context, email string) (*a.User, error) {
 	row := s.pool.QueryRow(ctx, `
-		SELECT id, email, password_hash, role, created_at
+		SELECT `+userColumns+`
 		  FROM users WHERE lower(email) = lower($1)
 	`, email)
 	u, err := scanUser(row)
@@ -64,7 +63,7 @@ func (s *Store) UserByEmail(ctx context.Context, email string) (*a.User, error) 
 
 func (s *Store) UserByID(ctx context.Context, id string) (*a.User, error) {
 	row := s.pool.QueryRow(ctx, `
-		SELECT id, email, password_hash, role, created_at
+		SELECT `+userColumns+`
 		  FROM users WHERE id = $1
 	`, id)
 	u, err := scanUser(row)
@@ -91,7 +90,7 @@ func (s *Store) CreateSession(ctx context.Context, sess a.Session) error {
 func (s *Store) SessionByTokenHash(ctx context.Context, tokenHash string) (*a.Session, *a.User, error) {
 	row := s.pool.QueryRow(ctx, `
 		SELECT s.token_hash, s.user_id, s.expires_at, s.created_at,
-		       u.id, u.email, u.password_hash, u.role, u.created_at
+		       u.id, u.email, u.password_hash, u.role, u.verified_at, u.created_at
 		  FROM sessions s JOIN users u ON u.id = s.user_id
 		 WHERE s.token_hash = $1
 	`, tokenHash)
@@ -99,7 +98,7 @@ func (s *Store) SessionByTokenHash(ctx context.Context, tokenHash string) (*a.Se
 	var user a.User
 	if err := row.Scan(
 		&sess.TokenHash, &sess.UserID, &sess.ExpiresAt, &sess.CreatedAt,
-		&user.ID, &user.Email, &user.PasswordHash, &user.Role, &user.CreatedAt,
+		&user.ID, &user.Email, &user.PasswordHash, &user.Role, &user.VerifiedAt, &user.CreatedAt,
 	); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil, a.ErrNotFound
@@ -128,9 +127,72 @@ func (s *Store) DeleteUserSessions(ctx context.Context, userID string) error {
 	return err
 }
 
+func (s *Store) CreateEmailVerification(ctx context.Context, v a.EmailVerification) error {
+	if v.TokenHash == "" || v.UserID == "" || v.Email == "" {
+		return a.ErrInvalidInput
+	}
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO email_verifications (token_hash, user_id, email, expires_at)
+		VALUES ($1, $2, $3, $4)
+	`, v.TokenHash, v.UserID, v.Email, v.ExpiresAt)
+	return err
+}
+
+// ConsumeEmailVerification runs the validation, mark-consumed, and
+// mark-user-verified inside one transaction. SELECT FOR UPDATE prevents two
+// concurrent clicks on the same link from both succeeding.
+func (s *Store) ConsumeEmailVerification(ctx context.Context, tokenHash string) (*a.EmailVerification, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var v a.EmailVerification
+	err = tx.QueryRow(ctx, `
+		SELECT token_hash, user_id, email, expires_at, consumed_at, created_at
+		  FROM email_verifications
+		 WHERE token_hash = $1
+		 FOR UPDATE
+	`, tokenHash).Scan(&v.TokenHash, &v.UserID, &v.Email, &v.ExpiresAt, &v.ConsumedAt, &v.CreatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, a.ErrNotFound
+		}
+		return nil, err
+	}
+	if v.ConsumedAt != nil {
+		return nil, a.ErrAlreadyConsumed
+	}
+	now := time.Now().UTC()
+	if now.After(v.ExpiresAt) {
+		return nil, a.ErrExpired
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE email_verifications SET consumed_at = $1 WHERE token_hash = $2
+	`, now, tokenHash); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE users SET verified_at = COALESCE(verified_at, $1) WHERE id = $2
+	`, now, v.UserID); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	v.ConsumedAt = &now
+	return &v, nil
+}
+
+// userColumns lists user fields in the order scanUser expects. Centralized so
+// every SELECT/RETURNING that hydrates a User stays in sync with the scan.
+const userColumns = `id, email, password_hash, role, verified_at, created_at`
+
 func scanUser(row pgx.Row) (*a.User, error) {
 	var u a.User
-	if err := row.Scan(&u.ID, &u.Email, &u.PasswordHash, &u.Role, &u.CreatedAt); err != nil {
+	if err := row.Scan(&u.ID, &u.Email, &u.PasswordHash, &u.Role, &u.VerifiedAt, &u.CreatedAt); err != nil {
 		return nil, err
 	}
 	return &u, nil

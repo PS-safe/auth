@@ -51,6 +51,7 @@ mux.Handle("GET /admin", middleware.RequireSession(store)(
 - **RBAC built in.** Static role-permission map; tiny, obvious, and easy to extend when needed.
 - **Cookies are `HttpOnly`, `Secure`, `SameSite=Lax`** by default in `cmd/server`.
 - **Credential endpoints are rate-limited.** `/signup` and `/login` share one per-IP sliding-window limiter (5/min) via [`github.com/PS-safe/ratelimit`](https://github.com/PS-safe/ratelimit) — basic defense against credential stuffing and signup abuse.
+- **Email verification, atomically.** Signup issues an opaque verification token (sha256 in the DB, raw in the email) via [`github.com/PS-safe/mailer`](https://github.com/PS-safe/mailer). `ConsumeEmailVerification` validates + marks consumed + sets `users.verified_at` in one transaction — two clicks on the same link can't both succeed.
 
 ## Status
 
@@ -63,10 +64,14 @@ type Store interface {
     CreateUser(ctx, User) (*User, error)
     UserByEmail(ctx, email) (*User, error)
     UserByID(ctx, id) (*User, error)
+
     CreateSession(ctx, Session) error
     SessionByTokenHash(ctx, hash) (*Session, *User, error)
     DeleteSession(ctx, hash) error
     DeleteUserSessions(ctx, userID) error
+
+    CreateEmailVerification(ctx, EmailVerification) error
+    ConsumeEmailVerification(ctx, tokenHash) (*EmailVerification, error)
 }
 ```
 
@@ -74,11 +79,17 @@ type Store interface {
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/signup` | `{email, password}` → 201 + `Set-Cookie` |
+| `POST` | `/signup` | `{email, password}` → 201 + `Set-Cookie` + sends verification email |
 | `POST` | `/login`  | `{email, password}` → 200 + `Set-Cookie` |
 | `POST` | `/logout` | revoke current session |
 | `GET`  | `/me`     | current user (requires session) |
+| `GET`  | `/verify?token=...` | consume verification link from email |
+| `POST` | `/verify/resend`    | re-send verification email (requires session) |
 | `GET`  | `/admin/users` | admin-only (requires `users:read`) |
+
+The `cmd/server` demo lets users log in without verifying — `User.VerifiedAt`
+is exposed so callers can apply their own policy (block features, force a
+nag bar, etc.) per app.
 
 ## Configuration (env)
 
@@ -86,6 +97,11 @@ type Store interface {
 |---|---|---|---|
 | `DATABASE_URL` | no | (in-memory) | Postgres DSN; if unset, uses volatile in-memory store |
 | `PORT` | no | `8080` | HTTP listen port |
+| `BASE_URL` | no | `http://localhost:8080` | used to build the verification link |
+| `MAILER_BACKEND` | no | `memory` | `memory` (captures, no real send), `smtp`, or `brevo` |
+| `MAIL_FROM` / `MAIL_FROM_NAME` | for real sends | — | sender address |
+| `BREVO_API_KEY` | brevo | — | Brevo API key |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USERNAME` / `SMTP_PASSWORD` | smtp | — | SMTP server |
 
 ## Local dev
 
@@ -97,7 +113,6 @@ go run ./cmd/server
 ## Roadmap
 
 - [ ] Refresh tokens (long-lived opaque) on top of short-lived access tokens
-- [ ] Email verification on signup
 - [ ] Password reset flow (one-time tokens, expiry, single-use)
 - [ ] OAuth providers (Google, GitHub) behind a uniform interface
 - [ ] WebAuthn / passkeys

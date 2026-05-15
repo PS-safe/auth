@@ -11,17 +11,19 @@ import (
 )
 
 type Store struct {
-	mu        sync.RWMutex
-	users     map[string]*a.User // id -> user
-	usersByEmail map[string]string // email (lowercase) -> id
-	sessions  map[string]*a.Session // tokenHash -> session
+	mu            sync.RWMutex
+	users         map[string]*a.User              // id -> user
+	usersByEmail  map[string]string               // email (lowercase) -> id
+	sessions      map[string]*a.Session           // tokenHash -> session
+	verifications map[string]*a.EmailVerification // tokenHash -> verification
 }
 
 func New() *Store {
 	return &Store{
-		users:        make(map[string]*a.User),
-		usersByEmail: make(map[string]string),
-		sessions:     make(map[string]*a.Session),
+		users:         make(map[string]*a.User),
+		usersByEmail:  make(map[string]string),
+		sessions:      make(map[string]*a.Session),
+		verifications: make(map[string]*a.EmailVerification),
 	}
 }
 
@@ -123,4 +125,47 @@ func (s *Store) DeleteUserSessions(_ context.Context, userID string) error {
 		}
 	}
 	return nil
+}
+
+func (s *Store) CreateEmailVerification(_ context.Context, v a.EmailVerification) error {
+	if v.TokenHash == "" || v.UserID == "" || v.Email == "" {
+		return a.ErrInvalidInput
+	}
+	if v.CreatedAt.IsZero() {
+		v.CreatedAt = time.Now().UTC()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.users[v.UserID]; !ok {
+		return a.ErrNotFound
+	}
+	cp := v
+	s.verifications[v.TokenHash] = &cp
+	return nil
+}
+
+func (s *Store) ConsumeEmailVerification(_ context.Context, tokenHash string) (*a.EmailVerification, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, ok := s.verifications[tokenHash]
+	if !ok {
+		return nil, a.ErrNotFound
+	}
+	if v.ConsumedAt != nil {
+		return nil, a.ErrAlreadyConsumed
+	}
+	if time.Now().UTC().After(v.ExpiresAt) {
+		return nil, a.ErrExpired
+	}
+	user, ok := s.users[v.UserID]
+	if !ok {
+		// User deleted between create and consume — same as not-found from
+		// the verification's perspective.
+		return nil, a.ErrNotFound
+	}
+	now := time.Now().UTC()
+	v.ConsumedAt = &now
+	user.VerifiedAt = &now
+	cp := *v
+	return &cp, nil
 }

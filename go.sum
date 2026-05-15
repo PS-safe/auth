@@ -1,3 +1,5 @@
+github.com/PS-safe/mailer v0.0.0-20260514130805-448f85486368 h1:QrTfgfBBoDf7D6GjH3nsV0DdwpTsdvh+W9Y8QQhg9Bk=
+github.com/PS-safe/mailer v0.0.0-20260514130805-448f85486368/go.mod h1:z4BQGwrlaO/XfuoQUTR9sezTD1WYJW2hQRhD18x+xVM=
 github.com/PS-safe/ratelimit v0.0.0-20260513101740-816754d3fa5a h1:lo3D3KY6u342WOBTpz0Fdmlzht6f3dThSSyt5jp49jw=
 github.com/PS-safe/ratelimit v0.0.0-20260513101740-816754d3fa5a/go.mod h1:T7s/bvXAXwnY5swf3mamAvTIZmegBhd+eTCH1+vWyQ0=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
